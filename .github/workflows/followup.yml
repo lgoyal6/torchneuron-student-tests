@@ -1,5 +1,5 @@
 name: followup
-on: [push, workflow_dispatch]
+on: [workflow_dispatch]
 
 env:
   NEURON_PLATFORM_TARGET_OVERRIDE: trn2
