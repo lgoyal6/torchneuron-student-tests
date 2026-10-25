@@ -1,0 +1,19 @@
+name: stablehlo-correctness
+on: [push, workflow_dispatch]
+env:
+  NEURON_PLATFORM_TARGET_OVERRIDE: trn2
+  NEURON_LOGICAL_NC_CONFIG: "2"
+  NEURON_RT_FAKE_INSTANCE_TYPE: trn2.48xlarge
+jobs:
+  shlo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container: ubuntu:26.04
+    env:
+      PATH: /tmp/venv/bin:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git ca-certificates libarchive13t64 >/dev/null
+      - uses: actions/checkout@v4
+      - run: bash probes/install.sh pip-only && bash probes/install.sh runtime && pip install -q transformers jax && pip list 2>/dev/null | grep -E "^(jax|jaxlib|transformers) "
+      - name: StableHLO lowering vs PyTorch on XLA CPU
+        run: python probes/shlo_check.py 2>&1 | grep -E "^SHLO|Traceback" | cut -c1-400
