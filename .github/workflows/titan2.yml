@@ -22,13 +22,4 @@ jobs:
           python -c "import triton" 2>&1 | tail -1; echo "triton before: $?"
           pip install -q triton && pip list 2>/dev/null | grep -iE "^(triton|torch) "
       - name: torchtitan_neuron test suite
-        run: cd /tmp/tt && python -m pytest -p no:cacheprovider torchtitan_neuron/tests -q -rs 2>&1 | tail -25 || true
-      - name: qwen3 debug model, 2 steps, compile-only
-        run: |
-          cd /tmp/tt; set +e
-          TORCH_NEURONX_COMPILE_ONLY=1 NGPU=1 MODULE=qwen3 CONFIG=qwen3_debugmodel timeout 2400 ./run_train.sh \
-            --training.steps 2 --training.local_batch_size 1 --training.seq_len 256 \
-            --compile.enable --compile.backend neuron > /tmp/tt.log 2>&1
-          echo "exit=$?"
-          grep -vE "NRT:|TDRV:|^\s*$" /tmp/tt.log | grep -E "step:|Error|error|Traceback|File \"/tmp/tt|Compilation|Building|device|loss" | tail -30
-          echo "neffs: $(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)"
+        run: cd /tmp/tt && python -m pytest -p no:cacheprovider torchtitan_neuron/tests -q -rf --tb=line 2>&1 | grep -E '^FAILED|^/tmp/tt.*Error|^E |passed|failed' | cut -c1-400 || true
