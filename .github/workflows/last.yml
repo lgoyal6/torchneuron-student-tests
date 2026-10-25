@@ -1,0 +1,22 @@
+name: last-checks
+on: [push, workflow_dispatch]
+env:
+  NEURON_PLATFORM_TARGET_OVERRIDE: trn2
+  NEURON_LOGICAL_NC_CONFIG: "2"
+  NEURON_RT_FAKE_INSTANCE_TYPE: trn2.48xlarge
+jobs:
+  last:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      PATH: /tmp/venv/bin:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git ca-certificates libarchive13t64 >/dev/null
+      - uses: actions/checkout@v4
+      - run: bash probes/install.sh pip-only && bash probes/install.sh runtime && pip install -q transformers
+      - name: persistent cache, same GPT-2 compile in two fresh processes
+        run: |
+          rm -rf /tmp/neff_cache
+          for run in 1 2; do s=$(date +%s); python probes/t_gpt2.py 12 128 2>&1 | grep -E "^RESULT"; echo "CACHE run $run wall: $(( $(date +%s)-s ))s, neffs on disk: $(find /tmp/neff_cache -name '*.neff' | wc -l)"; done
+      - name: issue 1021
+        run: python probes/t_issue1021.py 2>&1 | grep -E "^ISSUE" || true
