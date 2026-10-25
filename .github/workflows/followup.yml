@@ -1,0 +1,49 @@
+name: followup
+on: [push, workflow_dispatch]
+
+env:
+  NEURON_PLATFORM_TARGET_OVERRIDE: trn2
+  NEURON_LOGICAL_NC_CONFIG: "2"
+  NEURON_RT_FAKE_INSTANCE_TYPE: trn2.48xlarge
+
+jobs:
+  unclear-items:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      PATH: /tmp/venv/bin:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git ca-certificates libarchive13t64 >/dev/null
+      - uses: actions/checkout@v4
+      - run: bash probes/install.sh pip-only && bash probes/install.sh runtime
+      - name: missing NEURON_RT_FAKE_INSTANCE_TYPE, full output
+        run: env -u NEURON_RT_FAKE_INSTANCE_TYPE python probes/t_fail.py ok 2>&1 | grep -vE "NRT:" | tail -15 || true
+      - name: CPU input under compile-only, full error
+        run: python probes/t_cpu_input.py 2>&1 | grep -E "^STAGE|NCC_|ERROR \[|error:" | grep -v "NRT:" | cut -c1-600 | head -12 || true
+
+  torchtitan-neuron:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      PATH: /tmp/venv/bin:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git ca-certificates libarchive13t64 >/dev/null
+      - uses: actions/checkout@v4
+      - run: bash probes/install.sh pip-only && bash probes/install.sh runtime
+      - name: install torchtitan-neuron (README steps + dev requirements)
+        run: |
+          git clone -q https://github.com/aws-neuron/torchtitan-neuron.git /tmp/tt
+          cd /tmp/tt && git checkout -q release_2.33.0 && git log --oneline -1
+          pip install -q -r requirements.txt && pip install -q -e . && pip install -q -r requirements-dev.txt
+      - name: torchtitan_neuron test suite
+        run: cd /tmp/tt && python -m pytest -p no:cacheprovider torchtitan_neuron/tests -q -rs 2>&1 | tail -25 || true
+      - name: qwen3 debug model, 2 steps, compile-only, torch.compile neuron
+        run: |
+          cd /tmp/tt
+          set +e
+          TORCH_NEURONX_COMPILE_ONLY=1 NGPU=1 MODULE=qwen3 CONFIG=qwen3_debugmodel timeout 2400 ./run_train.sh \
+            --training.steps 2 --training.local_batch_size 1 --training.seq_len 256 \
+            --compile.enable --compile.backend neuron > /tmp/tt.log 2>&1
+          echo "exit=$?"
+          grep -vE "NRT:|^\s*$" /tmp/tt.log | grep -E "step:|Error|error|Traceback|raise|File \"/tmp/tt|Compilation|Building|Model|device" | tail -30
+          echo "neffs: $(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)"
