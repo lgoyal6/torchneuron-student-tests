@@ -142,7 +142,55 @@ def prepare(text):
                     r"chlo.erf \1 : \3 -> \4", t2)
     if n:
         notes.append(f"replaced {n} AwsNeuronErf with chlo.erf")
+    t3 = substitute_kernels(t3, notes)
     return t3, notes
+
+
+def substitute_kernels(text, notes):
+    """Swap AwsNeuronSilu/TopK/ArgMax custom calls for standard StableHLO/CHLO with the same meaning."""
+    import re
+    out, counts = [], {}
+    pat = re.compile(r'^(\s*)(%[\w]+)(?::2)? = stablehlo\.custom_call @AwsNeuron(Silu|TopK|ArgMax)\((%[\w#]+)\)\s*'
+                     r'(?:\{backend_config = "(\d+)"\})?\s*:\s*\((tensor<([^>]+)>)\)\s*->\s*(.*?)(\s+loc\(.*)?$')
+    renames = {}
+    for line in text.split("\n"):
+        m = pat.match(line)
+        if not m:
+            out.append(line)
+            continue
+        ind, res, kind, x, cfg, xt, xshape, rt = m.group(1, 2, 3, 4, 5, 6, 7, 8)
+        dims = xshape.split("x")[:-1]
+        elt = xshape.split("x")[-1]
+        r = "sub" + res[1:]
+        if kind == "Silu":
+            out.append(f"{ind}%{r}_sg = stablehlo.logistic {x} : {xt}")
+            out.append(f"{ind}{res} = stablehlo.multiply {x}, %{r}_sg : {xt}")
+        elif kind == "TopK":
+            k = int(cfg)
+            vt = f"tensor<{'x'.join(dims[:-1] + [str(k)])}x{elt}>"
+            it32 = f"tensor<{'x'.join(dims[:-1] + [str(k)])}xi32>"
+            it64 = it32.replace("xi32>", "xi64>")
+            out.append(f"{ind}%{r}_tk:2 = chlo.top_k({x}, k = {k}) : {xt} -> ({vt}, {it32})")
+            out.append(f"{ind}%{r}_i = stablehlo.convert %{r}_tk#1 : ({it32}) -> {it64}")
+            renames[f"{res}#0"], renames[f"{res}#1"] = f"%{r}_tk#0", f"%{r}_i"
+        elif kind == "ArgMax":
+            axis = int(cfg)
+            if axis != len(dims) - 1:
+                out.append(line)
+                continue
+            vt = f"tensor<{'x'.join(dims[:-1] + ['1'])}x{elt}>"
+            it32 = f"tensor<{'x'.join(dims[:-1] + ['1'])}xi32>"
+            it64 = it32.replace("xi32>", "xi64>")
+            out.append(f"{ind}%{r}_tk:2 = chlo.top_k({x}, k = 1) : {xt} -> ({vt}, {it32})")
+            out.append(f"{ind}%{r}_c = stablehlo.convert %{r}_tk#1 : ({it32}) -> {it64}")
+            out.append(f"{ind}{res} = stablehlo.reshape %{r}_c : ({it64}) -> {rt.strip()}")
+        counts[kind] = counts.get(kind, 0) + 1
+    text = "\n".join(out)
+    for old, new in renames.items():
+        text = re.sub(re.escape(old) + r"\b", new, text)
+    if counts:
+        notes.append("substituted reference impls for " + ", ".join(f"{v}x AwsNeuron{k}" for k, v in counts.items()))
+    return text
 
 
 def arg_types(text):
