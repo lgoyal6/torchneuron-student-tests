@@ -1,0 +1,91 @@
+name: torchneuron-probes
+on: [push, workflow_dispatch]
+
+env:
+  NEURON_PLATFORM_TARGET_OVERRIDE: trn2
+  NEURON_LOGICAL_NC_CONFIG: "2"
+  NEURON_RT_FAKE_INSTANCE_TYPE: trn2.48xlarge
+
+jobs:
+  # Native Ubuntu 24.04 x86 runner, no container: README pip steps.
+  ubuntu-2404-native:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash probes/install.sh pip-only
+      - name: max GLIBC required by torch_neuronx/_C.so
+        run: |
+          ldd --version | head -1
+          objdump -T /tmp/venv/lib/python3*/site-packages/torch_neuronx/_C.so | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1
+      - name: import torch, no Neuron runtime
+        run: /tmp/venv/bin/python -I -c "import torch; print('IMPORT OK')" 2>&1 | grep -E "IMPORT OK|ImportError" || true
+      - run: bash probes/install.sh runtime
+      - name: import torch, runtime installed
+        run: /tmp/venv/bin/python -I -c "import torch; print('IMPORT OK')" 2>&1 | grep -E "IMPORT OK|ImportError" || true
+
+  # Ubuntu 26.04 container on a native x86 runner.
+  ubuntu-2604:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      PATH: /tmp/venv/bin:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git ca-certificates >/dev/null
+      - uses: actions/checkout@v4
+      - run: bash probes/install.sh pip-only
+      - name: import torch, no Neuron runtime
+        run: python -I -c "import torch; print('IMPORT OK')" 2>&1 | grep -E "IMPORT OK|ImportError" || true
+      - run: bash probes/install.sh runtime
+      - name: import torch, runtime installed
+        run: python -I -c "import torch; print('IMPORT OK')" 2>&1 | grep -E "IMPORT OK|ImportError|Error" | head -3 || true
+      - name: libarchive present after README steps?
+        run: ls /usr/lib/x86_64-linux-gnu/libarchive.so.13 || echo "libarchive.so.13 MISSING"
+      - name: compile failure surfacing, libarchive missing
+        run: python probes/t_fail.py ok 2>&1 | grep -E "^STAGE" || true
+      - run: apt-get install -y -qq libarchive13t64 >/dev/null
+      - name: compile failure surfacing, cases
+        run: |
+          for c in ok eigh fft sort; do rm -rf /tmp/neff_cache; python probes/t_fail.py $c 2>&1 | grep -E "^STAGE" || true; done
+          rm -rf /tmp/neff_cache; NEURON_CC_FLAGS=--this-flag-does-not-exist python probes/t_fail.py badflag 2>&1 | grep -E "^STAGE" || true
+      - name: missing NEURON_RT_FAKE_INSTANCE_TYPE
+        run: env -u NEURON_RT_FAKE_INSTANCE_TYPE python probes/t_fail.py ok 2>&1 | grep -E "^STAGE" || true
+      - name: edge cases (nki, dynamic, float64, graphbreak)
+        run: for c in nki dynamic float64 graphbreak; do rm -rf /tmp/neff_cache; python probes/t_cases.py $c 2>&1 | grep -E "^RESULT" || true; done
+      - name: GPT-2 small, 12 layers
+        run: |
+          pip install -q transformers
+          rm -rf /tmp/neff_cache; timeout 1500 python probes/t_gpt2.py 12 128 2>&1 | grep -E "^RESULT" || true
+      - name: repo compile-only tests
+        run: |
+          git clone -q --depth 1 https://github.com/aws-neuron/torch-neuronx.git /tmp/r
+          cd /tmp/r && rm -rf torch_neuronx && pip install -q pytest
+          python -m pytest -p no:cacheprovider -o addopts="" tests/neuron_dynamo_backend/e2e/test_compile_only_api.py -q 2>&1 | tail -3 || true
+      - name: repo examples, TORCH_NEURONX_COMPILE_ONLY=1
+        run: |
+          ln -sfn /tmp/r /repo
+          bash probes/run_examples.sh || true
+
+  torchtitan-neuron:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      PATH: /tmp/venv/bin:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git ca-certificates libarchive13t64 >/dev/null
+      - uses: actions/checkout@v4
+      - run: bash probes/install.sh pip-only && bash probes/install.sh runtime
+      - name: install torchtitan-neuron (README steps)
+        run: |
+          git clone -q https://github.com/aws-neuron/torchtitan-neuron.git /tmp/tt
+          cd /tmp/tt && git checkout -q release_2.33.0 && git log --oneline -1
+          pip install -q -r requirements.txt && pip install -q -e . && pip install -q pytest
+      - name: torchtitan_neuron test suite (CPU-runnable parts)
+        run: cd /tmp/tt && python -m pytest -p no:cacheprovider torchtitan_neuron/tests -q 2>&1 | tail -15 || true
+      - name: qwen3 debug model, 2 steps, compile-only, torch.compile neuron
+        run: |
+          cd /tmp/tt
+          TORCH_NEURONX_COMPILE_ONLY=1 NGPU=1 MODULE=qwen3 CONFIG=qwen3_debugmodel timeout 2400 ./run_train.sh \
+            --training.steps 2 --training.local_batch_size 1 --training.seq_len 256 \
+            --compile.enable --compile.backend neuron > /tmp/tt.log 2>&1; echo "exit=$?"
+          grep -E "step: |Error|error:|Traceback|Compilation failed" /tmp/tt.log | grep -vE "NRT:" | tail -20 || true
+          echo "neffs: $(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)"
